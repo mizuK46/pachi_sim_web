@@ -1,0 +1,678 @@
+<!DOCTYPE html>
+<html lang="ja">
+	<head>
+		<meta charset="utf-8">
+		<meta name="viewport" content="width=device-width, user-scalable=no, initial-scale=1.0, viewport-fit=cover">
+		<title>pachi_sim_proto</title>
+		<style>
+html, body, #canvas {
+	margin: 0;
+	padding: 0;
+	border: 0;
+}
+
+body {
+	color: white;
+	background-color: black;
+	overflow: hidden;
+	touch-action: none;
+}
+
+/* キャンバスを包む台。スマホではこれをCSSで拡大縮小・移動させる。
+   PCでは何もせず、Godotが従来どおりウィンドウ一杯にキャンバスを広げる */
+#stage {
+	position: absolute;
+	left: 0;
+	top: 0;
+	transform-origin: 0 0;
+}
+
+#canvas {
+	display: block;
+}
+
+#canvas:focus {
+	outline: none;
+}
+
+/* スマホでは等倍のキャンバスをCSSで拡大するので、補間でぼやけないようにする */
+body.touch-mode #canvas {
+	image-rendering: pixelated;
+}
+
+#mobile-hint {
+	position: fixed;
+	left: 0;
+	right: 0;
+	bottom: 12px;
+	margin: 0 auto;
+	width: fit-content;
+	max-width: 92%;
+	padding: 8px 14px;
+	border-radius: 8px;
+	background: rgba(0, 0, 0, 0.72);
+	border: 1px solid rgba(255, 210, 120, 0.5);
+	color: #ffe6b0;
+	font-family: 'Noto Sans', 'Droid Sans', Arial, sans-serif;
+	font-size: 13px;
+	line-height: 1.5;
+	text-align: center;
+	pointer-events: none;
+	z-index: 2;
+	display: none;
+	transition: opacity 0.6s;
+}
+
+#status, #status-splash, #status-progress {
+	position: absolute;
+	left: 0;
+	right: 0;
+}
+
+#status, #status-splash {
+	top: 0;
+	bottom: 0;
+}
+
+#status {
+	background-color: #242424;
+	display: flex;
+	flex-direction: column;
+	justify-content: center;
+	align-items: center;
+	visibility: hidden;
+}
+
+#status-splash {
+	max-height: 100%;
+	max-width: 100%;
+	margin: auto;
+}
+
+#status-splash.show-image--false {
+	display: none;
+}
+
+#status-splash.fullsize--true {
+	height: 100%;
+	width: 100%;
+	object-fit: contain;
+}
+
+#status-splash.use-filter--false {
+	image-rendering: pixelated;
+}
+
+#status-progress, #status-notice {
+	display: none;
+}
+
+#status-progress {
+	bottom: 10%;
+	width: 50%;
+	margin: 0 auto;
+}
+
+#status-notice {
+	background-color: #5b3943;
+	border-radius: 0.5rem;
+	border: 1px solid #9b3943;
+	color: #e0e0e0;
+	font-family: 'Noto Sans', 'Droid Sans', Arial, sans-serif;
+	line-height: 1.3;
+	margin: 0 2rem;
+	overflow: hidden;
+	padding: 1rem;
+	text-align: center;
+	z-index: 1;
+}
+		</style>
+		<link id="-gd-engine-icon" rel="icon" type="image/png" href="index.icon.png" />
+<link rel="apple-touch-icon" href="index.apple-touch-icon.png"/>
+
+	</head>
+	<body>
+		<div id="stage">
+			<canvas id="canvas">
+				Your browser does not support the canvas tag.
+			</canvas>
+		</div>
+
+		<div id="mobile-hint">画面をタップすると全画面・横向きになります<br>1本指でなぞるとスクロール / 2本指で移動・ピンチで拡大縮小</div>
+
+		<noscript>
+			Your browser does not support JavaScript.
+		</noscript>
+
+		<div id="status">
+			<img id="status-splash" class="show-image--true fullsize--true use-filter--true" src="index.png" alt="">
+			<progress id="status-progress"></progress>
+			<div id="status-notice"></div>
+		</div>
+
+		<script src="index.js"></script>
+		<script>
+const GODOT_CONFIG = {"args":[],"canvasResizePolicy":2,"emscriptenPoolSize":8,"ensureCrossOriginIsolationHeaders":false,"executable":"index","experimentalVK":true,"fileSizes":{"index.pck":52574012,"index.wasm":39514754},"focusCanvas":true,"gdextensionLibs":[],"godotPoolSize":4};
+const GODOT_THREADS_ENABLED = false;
+
+// --- スマホ対応 ---------------------------------------------------------
+// ゲームは1280x720の固定レイアウトで作ってある。スマホの画面幅に合わせて
+// 縮めると字が読めないので、等倍のまま置いて「2本指でスクロール・ピンチで
+// 拡大縮小」できるようにする。1本指はゲームの操作としてそのまま通す。
+//
+// Godotのキャンバスはtouchstart/move/endで必ずpreventDefaultを呼ぶため、
+// ブラウザ本来のスクロールやピンチは効かない。そこでwindowのキャプチャ段階で
+// 2本指のときだけイベントを止めて、自前でCSS transformを動かす。
+const GAME_W = 1280;
+const GAME_H = 720;
+// 配信の反映を確かめるための目印。シェルを直したら必ず上げること。
+// スマホのブラウザはindex.htmlを10分キャッシュするので、直したはずの挙動が
+// 変わらないときは、まずここが新しくなっているかを見る
+const BUILD = 'b5';
+// ?touch=1 を付けるとPCでもスマホ用の表示になる(動作確認・見た目の確認用)
+const TOUCH_MODE = window.matchMedia('(pointer: coarse)').matches
+	|| window.location.search.indexOf('touch=1') >= 0;
+
+if (TOUCH_MODE) {
+	// キャンバスの大きさはこちらで決めるので、Godotには触らせない
+	GODOT_CONFIG['canvasResizePolicy'] = 0;
+}
+
+const engine = new Engine(GODOT_CONFIG);
+
+(function setupTouchView() {
+	if (!TOUCH_MODE) {
+		return;
+	}
+	const stage = document.getElementById('stage');
+	const canvas = document.getElementById('canvas');
+	document.body.classList.add('touch-mode');
+	canvas.width = GAME_W;
+	canvas.height = GAME_H;
+	canvas.style.width = GAME_W + 'px';
+	canvas.style.height = GAME_H + 'px';
+
+	let scale = 1;
+	let tx = 0;
+	let ty = 0;
+	let zoomed = false;   // 一度でも自分で拡大したか(回転時に倍率を保つため)
+
+	function fitScale() {
+		return Math.min(window.innerWidth / GAME_W, window.innerHeight / GAME_H);
+	}
+
+	function clamp(v, lo, hi) {
+		return Math.min(hi, Math.max(lo, v));
+	}
+
+	// 画面より小さければ中央に置き、大きければ画面の外に余白が出ないよう寄せる
+	function apply() {
+		const fit = fitScale();
+		scale = clamp(scale, fit, fit * 8);
+		const w = GAME_W * scale;
+		const h = GAME_H * scale;
+		const vw = window.innerWidth;
+		const vh = window.innerHeight;
+		tx = w <= vw ? (vw - w) / 2 : clamp(tx, vw - w, 0);
+		ty = h <= vh ? (vh - h) / 2 : clamp(ty, vh - h, 0);
+		stage.style.transform = 'translate(' + tx + 'px,' + ty + 'px) scale(' + scale + ')';
+	}
+
+	function reset() {
+		scale = fitScale();
+		zoomed = false;
+		apply();
+	}
+
+	reset();
+	window.addEventListener('resize', function () {
+		if (zoomed) {
+			apply();
+		} else {
+			reset();
+		}
+	});
+
+	// --- 2本指のジェスチャ ---
+	let gesture = false;
+	let baseDist = 0;
+	let baseScale = 1;
+	let baseMid = null;
+	let baseTx = 0;
+	let baseTy = 0;
+	// 2本目が触れた時点でゲーム側の「押しっぱなし」を解除できなかった場合、
+	// 最後のtouchendだけは通して離させる
+	let releaseByPassthrough = false;
+	// 1本指の状態。動かし始めるまではタップのままゲームへ通す
+	let drag = null;
+	// 自分が出した解除イベントを、自分のハンドラで拾わないための目印
+	let selfDispatch = false;
+	// いま触れている指の本数(診断表示用)
+	let touchCount = 0;
+
+	function distance(a, b) {
+		return Math.hypot(a.clientX - b.clientX, a.clientY - b.clientY);
+	}
+
+	function midpoint(a, b) {
+		return { x: (a.clientX + b.clientX) / 2, y: (a.clientY + b.clientY) / 2 };
+	}
+
+	function kill(e) {
+		if (e.cancelable) {
+			e.preventDefault();
+		}
+		e.stopPropagation();
+	}
+
+	// --- 最初のタップで全画面 + 横向きに ------------------------------------
+	// 全画面も画面の向きの固定も「利用者の操作の最中」でないと許可されないので、
+	// 最初にタップされた瞬間に試す。1回だけにしてある。自分で全画面を抜けた人に
+	// 何度も入り直させるのは邪魔になるため。
+	// 対応していない端末(iPhoneのSafariは要素の全画面に対応していない)では
+	// 何も起きない。その場合は案内の「横向きにすると見やすい」に従ってもらう。
+	let immersiveTries = 0;
+	const IMMERSIVE_MAX_TRIES = 3;
+
+	function goImmersive() {
+		if (immersiveTries >= IMMERSIVE_MAX_TRIES) {
+			return;
+		}
+		const el = document.documentElement;
+		const request = el.requestFullscreen || el.webkitRequestFullscreen;
+		if (typeof request !== 'function') {
+			immersiveTries = IMMERSIVE_MAX_TRIES;   // 端末が対応していない
+			return;
+		}
+		immersiveTries += 1;
+		let started = null;
+		try {
+			started = request.call(el, { navigationUI: 'hide' });
+		} catch (err) {
+			return;
+		}
+		Promise.resolve(started).then(function () {
+			// ここまで来たら成功。以後は自分で全画面を抜けた人を邪魔しない
+			immersiveTries = IMMERSIVE_MAX_TRIES;
+			if (window.screen && screen.orientation && screen.orientation.lock) {
+				return screen.orientation.lock('landscape');
+			}
+			return null;
+		}).catch(function () {
+			// 全画面を断られたか、向きの固定に対応していない端末。
+			// 断られただけなら次のタップでもう一度試す(上限まで)
+		});
+	}
+
+	// --- 1本指のドラッグを「ホイール」に変える -------------------------------
+	// 結果画面や所持機種一覧のScrollContainerは、指でなぞっても動かない。
+	// Godot側のタッチによるドラッグスクロールが効かないため(実機で確認済み)。
+	// ホイールなら確実に効くので、指の移動量をホイールのノッチに変換して送る。
+	// 少し動かしただけならタップのままにして、ボタンが押せなくならないようにする。
+	const DRAG_START = 14;    // これ以上動いたらスクロールとみなす(画面上のpx)
+	const WHEEL_STEP = 18;    // ゲーム座標で何px動くごとに1ノッチ送るか
+	const WHEEL_DELTA = 53;   // 1ノッチぶんのdeltaY(ブラウザの既定値に合わせる)
+
+	function fireWheel(x, y, dx, dy) {
+		wheelCount += 1;
+		canvas.dispatchEvent(new WheelEvent('wheel', {
+			bubbles: true, cancelable: true,
+			clientX: x, clientY: y, deltaX: dx, deltaY: dy, deltaMode: 0,
+		}));
+	}
+
+	function scrollByDrag(e) {
+		if (!drag || e.touches.length !== 1) {
+			return;
+		}
+		const t = e.touches[0];
+		if (!drag.scrolling) {
+			if (Math.hypot(t.clientX - drag.sx, t.clientY - drag.sy) < DRAG_START) {
+				// まだタップかもしれない。指を持っている間はゲームへ渡さない
+				// (押していないことになっているので、動きだけ届くと辻褄が合わない)
+				if (pending !== null) {
+					kill(e);
+				}
+				return;
+			}
+			drag.scrolling = true;
+			if (pending !== null) {
+				pending = null;   // なぞり始めたのでタップではない。渡さず捨てる
+				drag.passEnd = false;
+			} else {
+				// 素通りさせた端末では、ゲームが指を押したと思っているので離させる
+				drag.passEnd = !releaseGameTouches(e);
+			}
+			hideHint();
+		}
+		const s = scale > 0 ? scale : 1;   // 0除算で無限ループにならないように
+		drag.accX += (t.clientX - drag.lx) / s;
+		drag.accY += (t.clientY - drag.ly) / s;
+		drag.lx = t.clientX;
+		drag.ly = t.clientY;
+		// 指を下へ動かす = 中身が下がる = ホイールを上へ回す(deltaYは負)
+		let guard = 40;   // 1回の移動で送るノッチ数の上限(保険)
+		while (Math.abs(drag.accY) >= WHEEL_STEP && guard-- > 0) {
+			const down = drag.accY > 0;
+			fireWheel(t.clientX, t.clientY, 0, down ? -WHEEL_DELTA : WHEEL_DELTA);
+			drag.accY += down ? -WHEEL_STEP : WHEEL_STEP;
+		}
+		while (Math.abs(drag.accX) >= WHEEL_STEP && guard-- > 0) {
+			const right = drag.accX > 0;
+			fireWheel(t.clientX, t.clientY, right ? -WHEEL_DELTA : WHEEL_DELTA, 0);
+			drag.accX += right ? -WHEEL_STEP : WHEEL_STEP;
+		}
+		if (guard <= 0) {
+			drag.accX = 0;
+			drag.accY = 0;
+		}
+		kill(e);
+	}
+
+	// タッチイベントを自分で作ってゲームへ渡す。自分のハンドラにも届くので、
+	// 目印を立てて素通りさせる
+	function sendTouch(type, touches, changed) {
+		try {
+			selfDispatch = true;
+			canvas.dispatchEvent(new TouchEvent(type, {
+				bubbles: true,
+				cancelable: true,
+				touches: touches,
+				targetTouches: touches,
+				changedTouches: changed,
+			}));
+			return true;
+		} catch (err) {
+			return false;   // TouchEventを作れないブラウザ
+		} finally {
+			selfDispatch = false;
+		}
+	}
+
+	// ゲームに「指が離れた」ことにしてもらう(押しっぱなし防止)
+	function releaseGameTouches(e) {
+		const held = [];
+		for (let i = 0; i < e.touches.length; i++) {
+			held.push(e.touches[i]);
+		}
+		return sendTouch('touchcancel', [], held);
+	}
+
+	// --- タップは「指を離した時点」でまとめて渡す ---------------------------
+	// 拡大しようと2本指を置くとき、1本目が先にタップとして通ってしまい、
+	// 押した瞬間に反応する画面(新台入荷のカットインなど)が進んでしまっていた。
+	// 2本目を置くまでの間が空くと、少し待つ程度では防ぎきれない。
+	//
+	// そこで1本目は触れた時点では渡さず手元に持っておき、**指が離れたとき**に
+	// 押す/離すをまとめてゲームへ送る。こうすると、2本指になった場合や
+	// なぞった場合は1本目がゲームへ一切届かない。
+	// 押している間のボタンの見た目が変わらなくなるが、この作りに長押しの
+	// 操作は無いので実害はない。
+	//
+	// 合成タッチを作れない端末では従来どおり素通りさせる。上の取りこぼしは
+	// 残るが、タップそのものが効かなくなるよりはよい。
+	let canSynth = sendTouch('touchcancel', [], []);
+	let pending = null;     // 離すまで持っている1本目の指 (Touch)
+
+	window.addEventListener('touchstart', function (e) {
+		if (selfDispatch) {
+			return;   // 自分がゲームへ渡すために作ったイベント。触らない
+		}
+		goImmersive();   // 操作の最中でないと許可されないので、ここで試す
+		touchCount = e.touches.length;
+		debugShow();
+		if (e.touches.length < 2) {
+			// 動かし始めたらスクロールに切り替えられるよう、開始位置を覚えておく
+			const t = e.touches[0];
+			drag = { sx: t.clientX, sy: t.clientY, lx: t.clientX, ly: t.clientY,
+				accX: 0, accY: 0, scrolling: false, passEnd: false };
+			if (!canSynth) {
+				return;   // 持てない端末は従来どおり素通り
+			}
+			pending = t;   // 離すまで持っておく
+			kill(e);
+			return;
+		}
+		drag = null;                        // 2本目が来たらスクロールはやめてジェスチャへ
+		const wasHolding = pending !== null;
+		pending = null;                     // 1本目はタップではなかった。渡さない
+		if (!gesture) {
+			// 1本目を手元に持っていたなら、ゲームは指に気づいていないので
+			// 解除は要らない(要らない解除を送ると押していない指を離すことになる)
+			releaseByPassthrough = wasHolding ? false : !releaseGameTouches(e);
+			gesture = true;
+			hideHint();
+		}
+		baseDist = distance(e.touches[0], e.touches[1]);
+		baseScale = scale;
+		baseMid = midpoint(e.touches[0], e.touches[1]);
+		baseTx = tx;
+		baseTy = ty;
+		kill(e);
+	}, { capture: true, passive: false });
+
+	window.addEventListener('touchmove', function (e) {
+		if (selfDispatch) {
+			return;
+		}
+		touchCount = e.touches.length;
+		if (!gesture) {
+			scrollByDrag(e);
+			debugShow();
+			return;
+		}
+		debugShow();
+		if (e.touches.length >= 2 && baseDist > 0) {
+			const d = distance(e.touches[0], e.touches[1]);
+			const m = midpoint(e.touches[0], e.touches[1]);
+			const next = baseScale * (d / baseDist);
+			const k = next / baseScale;
+			scale = next;
+			// つまんだ中心の下にある景色が動かないように寄せる
+			// (2本指を平行移動させればそのままスクロールになる)
+			tx = m.x - (baseMid.x - baseTx) * k;
+			ty = m.y - (baseMid.y - baseTy) * k;
+			zoomed = true;
+			apply();
+		}
+		kill(e);
+	}, { capture: true, passive: false });
+
+	function onTouchEnd(e) {
+		if (selfDispatch) {
+			return;   // 自分が出した解除イベント
+		}
+		touchCount = e.touches.length;
+		debugShow();
+		if (!gesture && drag) {
+			const wasScrolling = drag.scrolling;
+			const pass = drag.passEnd;
+			drag = null;
+			if (wasScrolling) {
+				pending = null;
+				if (!pass) {
+					kill(e);   // スクロールだったのでタップとして成立させない
+				}
+				return;
+			}
+			if (pending !== null) {
+				// ここで初めてタップとしてゲームへ渡す。押した位置は触れた場所
+				const held = pending;
+				pending = null;
+				sendTouch('touchstart', [held], [held]);
+				sendTouch('touchend', [], [held]);
+				kill(e);   // 実イベントも渡すと二重に押したことになる
+			}
+			return;
+		}
+		if (!gesture) {
+			return;
+		}
+		if (e.touches.length === 0) {
+			gesture = false;
+			if (releaseByPassthrough) {
+				releaseByPassthrough = false;
+				return;   // ここだけ通して、ゲーム側の指を離させる
+			}
+		}
+		kill(e);
+	}
+
+	window.addEventListener('touchend', onTouchEnd, { capture: true, passive: false });
+	window.addEventListener('touchcancel', onTouchEnd, { capture: true, passive: false });
+
+	// --- 動作の診断表示 (?debug=1) ---
+	// 実機でだけ起きる不具合を調べるためのもの。指の本数・スクロールに
+	// 切り替わったか・ホイールを何回送ったかを画面に出す。
+	const DEBUG = window.location.search.indexOf('debug=1') >= 0;
+	let debugBox = null;
+	let wheelCount = 0;
+
+	function debugShow() {
+		if (!DEBUG) {
+			return;
+		}
+		if (debugBox === null) {
+			debugBox = document.createElement('div');
+			debugBox.style.cssText = 'position:fixed;left:4px;top:4px;z-index:9;'
+				+ 'padding:4px 7px;background:rgba(0,0,0,.75);color:#9f9;'
+				+ 'font:12px monospace;pointer-events:none;white-space:pre;';
+			document.body.appendChild(debugBox);
+		}
+		debugBox.textContent = BUILD
+			+ ' 指:' + touchCount
+			+ ' スクロール:' + (drag && drag.scrolling ? 'ON' : 'off')
+			+ ' ホイール:' + wheelCount
+			+ ' 倍率:' + scale.toFixed(2);
+	}
+
+	// --- 操作の案内 ---
+	const hint = document.getElementById('mobile-hint');
+	let hintTimer = 0;
+
+	function hideHint() {
+		if (!hint || hint.style.display === 'none') {
+			return;
+		}
+		hint.style.opacity = '0';
+		window.clearTimeout(hintTimer);
+		window.setTimeout(function () { hint.style.display = 'none'; }, 700);
+	}
+
+	if (hint) {
+		// 配信が反映されているかを見分けられるよう、案内にビルドの目印を足す
+		hint.appendChild(document.createElement('br'));
+		const tag = document.createElement('span');
+		tag.style.opacity = '0.65';
+		tag.style.fontSize = '11px';
+		tag.textContent = BUILD;
+		hint.appendChild(tag);
+		hint.style.display = 'block';
+		hintTimer = window.setTimeout(hideHint, 9000);
+	}
+	debugShow();
+}());
+
+(function () {
+	const statusOverlay = document.getElementById('status');
+	const statusProgress = document.getElementById('status-progress');
+	const statusNotice = document.getElementById('status-notice');
+
+	let initializing = true;
+	let statusMode = '';
+
+	function setStatusMode(mode) {
+		if (statusMode === mode || !initializing) {
+			return;
+		}
+		if (mode === 'hidden') {
+			statusOverlay.remove();
+			initializing = false;
+			return;
+		}
+		statusOverlay.style.visibility = 'visible';
+		statusProgress.style.display = mode === 'progress' ? 'block' : 'none';
+		statusNotice.style.display = mode === 'notice' ? 'block' : 'none';
+		statusMode = mode;
+	}
+
+	function setStatusNotice(text) {
+		while (statusNotice.lastChild) {
+			statusNotice.removeChild(statusNotice.lastChild);
+		}
+		const lines = text.split('\n');
+		lines.forEach((line) => {
+			statusNotice.appendChild(document.createTextNode(line));
+			statusNotice.appendChild(document.createElement('br'));
+		});
+	}
+
+	function displayFailureNotice(err) {
+		console.error(err);
+		if (err instanceof Error) {
+			setStatusNotice(err.message);
+		} else if (typeof err === 'string') {
+			setStatusNotice(err);
+		} else {
+			setStatusNotice('An unknown error occurred.');
+		}
+		setStatusMode('notice');
+		initializing = false;
+	}
+
+	const missing = Engine.getMissingFeatures({
+		threads: GODOT_THREADS_ENABLED,
+	});
+
+	if (missing.length !== 0) {
+		if (GODOT_CONFIG['serviceWorker'] && GODOT_CONFIG['ensureCrossOriginIsolationHeaders'] && 'serviceWorker' in navigator) {
+			let serviceWorkerRegistrationPromise;
+			try {
+				serviceWorkerRegistrationPromise = navigator.serviceWorker.getRegistration();
+			} catch (err) {
+				serviceWorkerRegistrationPromise = Promise.reject(new Error('Service worker registration failed.'));
+			}
+			// There's a chance that installing the service worker would fix the issue
+			Promise.race([
+				serviceWorkerRegistrationPromise.then((registration) => {
+					if (registration != null) {
+						return Promise.reject(new Error('Service worker already exists.'));
+					}
+					return registration;
+				}).then(() => engine.installServiceWorker()),
+				// For some reason, `getRegistration()` can stall
+				new Promise((resolve) => {
+					setTimeout(() => resolve(), 2000);
+				}),
+			]).then(() => {
+				// Reload if there was no error.
+				window.location.reload();
+			}).catch((err) => {
+				console.error('Error while registering service worker:', err);
+			});
+		} else {
+			// Display the message as usual
+			const missingMsg = 'Error\nThe following features required to run Godot projects on the Web are missing:\n';
+			displayFailureNotice(missingMsg + missing.join('\n'));
+		}
+	} else {
+		setStatusMode('progress');
+		engine.startGame({
+			'onProgress': function (current, total) {
+				if (current > 0 && total > 0) {
+					statusProgress.value = current;
+					statusProgress.max = total;
+				} else {
+					statusProgress.removeAttribute('value');
+					statusProgress.removeAttribute('max');
+				}
+			},
+		}).then(() => {
+			setStatusMode('hidden');
+		}, displayFailureNotice);
+	}
+}());
+		</script>
+	</body>
+</html>
+
